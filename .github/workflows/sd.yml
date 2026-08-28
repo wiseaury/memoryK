@@ -1,0 +1,418 @@
+name: Build exact Infinity X miprotect LKM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "kernel/**"
+      - ".github/workflows/infinityx.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "kernel/**"
+      - ".github/workflows/infinityx.yml"
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: Infinity X kernel repository
+        required: true
+        default: aosp-pablo/android_kernel_xiaomi_sm8450
+        type: string
+      kernel_ref:
+        description: Exact Infinity X branch, tag, or full commit
+        required: true
+        default: b4d13be4e909f7b74299b45ff0e8696226ca5fd8
+        type: string
+      expected_release:
+        description: Exact uname -r that the LKM must match
+        required: true
+        default: 5.10.252-Infx-gb4d13be4e909
+        type: string
+      clang_ref:
+        description: Google Android Clang repository commit/ref
+        required: true
+        default: d2de056d8d8de40b2c1ccd39bfadf0c0318f5bad
+        type: string
+      clang_dir:
+        description: Google Android Clang directory
+        required: true
+        default: clang-r563880c
+        type: string
+      module_symvers_url:
+        description: Optional trusted URL for the exact Module.symvers
+        required: false
+        default: ""
+        type: string
+      module_symvers_sha256:
+        description: Required SHA-256 when module_symvers_url is set
+        required: false
+        default: ""
+        type: string
+      allow_full_build:
+        description: On an ABI-cache miss, run the one-time Full-LTO bootstrap
+        required: true
+        default: false
+        type: boolean
+      runner:
+        description: Runner label; use a 32 GiB+ custom/self-hosted label for bootstrap
+        required: true
+        default: ubuntu-24.04
+        type: string
+      build_jobs:
+        description: Parallel jobs for a Full-LTO bootstrap
+        required: true
+        default: "2"
+        type: choice
+        options: ["1", "2", "4", "8"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infinityx-lkm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-lkm:
+    name: Exact Infinity X marble miprotect.ko
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KERNEL_REPO: ${{ inputs.kernel_repo || 'aosp-pablo/android_kernel_xiaomi_sm8450' }}
+      KERNEL_REF: ${{ inputs.kernel_ref || 'b4d13be4e909f7b74299b45ff0e8696226ca5fd8' }}
+      EXPECTED_RELEASE: ${{ inputs.expected_release || '5.10.252-Infx-gb4d13be4e909' }}
+      CLANG_REF: ${{ inputs.clang_ref || 'd2de056d8d8de40b2c1ccd39bfadf0c0318f5bad' }}
+      CLANG_DIR: ${{ inputs.clang_dir || 'clang-r563880c' }}
+      BUILD_JOBS: ${{ inputs.build_jobs || '2' }}
+      KERNEL_DIR: kernel-source
+      OUT_DIR: out
+      DIST_DIR: dist
+      KBUILD_BUILD_USER: infinityx
+      KBUILD_BUILD_HOST: github-actions
+      CONFIG_FRAGMENTS: >-
+        vendor/waipio_GKI.config
+        vendor/xiaomi_GKI.config
+        vendor/marble_GKI.config
+        vendor/debugfs.config
+        vendor/infinity.config
+
+    steps:
+      # Routine cache-backed builds do not modify the runner's disk layout.
+      - name: Prepare disk and swap for Full-LTO bootstrap
+        if: ${{ inputs.allow_full_build && inputs.module_symvers_url == '' }}
+        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 1024
+          swap-size-mb: 16384
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - name: Check out memoryK
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: memoryK
+          fetch-depth: 1
+
+      - name: Check out exact Infinity X kernel base
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_REF }}
+          path: ${{ env.KERNEL_DIR }}
+          # A shallow checkout reproduces the -g<12-character-SHA> suffix.
+          fetch-depth: 1
+
+      - name: Verify checked-out kernel revision
+        working-directory: kernel-source
+        run: |
+          set -euo pipefail
+          resolved_commit="$(git rev-parse HEAD)"
+          echo "Requested ref: ${KERNEL_REF}"
+          echo "Resolved commit: ${resolved_commit}"
+          if [[ "${KERNEL_REF}" =~ ^[0-9a-fA-F]{40}$ ]] &&
+             [[ "${resolved_commit,,}" != "${KERNEL_REF,,}" ]]; then
+            echo "::error::Checked-out kernel commit does not match KERNEL_REF."
+            exit 1
+          fi
+          git diff --quiet
+          git diff --cached --quiet
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential curl dwarves flex git kmod \
+            libelf-dev libssl-dev lld llvm python3 rsync xz-utils zstd
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Restore matching Google Android Clang
+        id: clang-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: toolchain
+          key: clang-${{ runner.os }}-${{ runner.arch }}-${{ env.CLANG_REF }}-${{ env.CLANG_DIR }}
+
+      - name: Download matching Google Android Clang
+        if: ${{ steps.clang-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p toolchain
+          archive_url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${CLANG_REF}/${CLANG_DIR}.tar.gz"
+          curl --fail --location --retry 4 --retry-all-errors \
+            "${archive_url}" -o clang.tar.gz
+          tar -xzf clang.tar.gz -C toolchain
+          rm -f clang.tar.gz
+
+      - name: Verify toolchain and module source
+        run: |
+          set -euo pipefail
+          test -x toolchain/bin/clang
+          toolchain/bin/clang --version
+          test -f memoryK/kernel/Makefile
+          test -f memoryK/kernel/Kconfig
+          test -f memoryK/kernel/memory.c
+          test -f memoryK/kernel/process.c
+          test -f memoryK/kernel/entry.c
+
+      - name: Configure exact Infinity X marble kernel
+        working-directory: kernel-source
+        env:
+          CC: clang
+        run: |
+          set -euo pipefail
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
+          make O="${OUT_DIR}" ARCH="${ARCH}" LLVM=1 LLVM_IAS=1 CC="${CC}" gki_defconfig
+
+          fragment_paths=()
+          for fragment in ${CONFIG_FRAGMENTS}; do
+            path="arch/arm64/configs/${fragment}"
+            if [[ ! -f "${path}" ]]; then
+              echo "::error::Missing Infinity X config fragment: ${path}"
+              exit 1
+            fi
+            fragment_paths+=("${path}")
+          done
+          scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" \
+            "${OUT_DIR}/.config" "${fragment_paths[@]}"
+          scripts/config --file "${OUT_DIR}/.config" --set-str LOCALVERSION "-Infx"
+          scripts/config --file "${OUT_DIR}/.config" --enable LOCALVERSION_AUTO
+          make O="${OUT_DIR}" ARCH="${ARCH}" LLVM=1 LLVM_IAS=1 CC="${CC}" olddefconfig
+
+          rm -f \
+            "${OUT_DIR}/include/config/auto.conf" \
+            "${OUT_DIR}/include/config/auto.conf.cmd" \
+            "${OUT_DIR}/include/generated/autoconf.h" \
+            "${OUT_DIR}/include/config/kernel.release"
+          make O="${OUT_DIR}" ARCH="${ARCH}" LLVM=1 LLVM_IAS=1 CC="${CC}" prepare
+
+          grep -qx 'CONFIG_LOCALVERSION="-Infx"' "${OUT_DIR}/.config"
+          grep -qx 'CONFIG_LOCALVERSION_AUTO=y' "${OUT_DIR}/.config"
+          grep -qx 'CONFIG_MODULES=y' "${OUT_DIR}/.config"
+          grep -qx 'CONFIG_MODVERSIONS=y' "${OUT_DIR}/.config"
+          grep -qx 'CONFIG_LTO_CLANG_FULL=y' "${OUT_DIR}/.config"
+
+          prepared_release="$(cat "${OUT_DIR}/include/config/kernel.release")"
+          printf 'Prepared kernel.release: %s\n' "${prepared_release}"
+          if [[ "${prepared_release}" != "${EXPECTED_RELEASE}" ]]; then
+            echo "::error::Expected ${EXPECTED_RELEASE}, got ${prepared_release}."
+            exit 1
+          fi
+          grep -E '^CONFIG_(LOCALVERSION|MODULES|MODVERSIONS|LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK)=' \
+            "${OUT_DIR}/.config" || true
+
+      - name: Calculate exact ABI cache identity
+        id: abi
+        working-directory: kernel-source
+        run: |
+          set -euo pipefail
+          resolved_commit="$(git rev-parse HEAD)"
+          config_sha256="$(sha256sum "${OUT_DIR}/.config" | awk '{print $1}')"
+          abi_id="$(
+            printf '%s\n' \
+              "schema=infinityx-symvers-v2" \
+              "kernel_repo=${KERNEL_REPO}" \
+              "kernel_commit=${resolved_commit}" \
+              "kernel_config_sha256=${config_sha256}" \
+              "kernel_release=${EXPECTED_RELEASE}" \
+              "clang_ref=${CLANG_REF}" \
+              "clang_dir=${CLANG_DIR}" \
+              | sha256sum | awk '{print $1}'
+          )"
+          echo "resolved_commit=${resolved_commit}" >> "${GITHUB_OUTPUT}"
+          echo "config_sha256=${config_sha256}" >> "${GITHUB_OUTPUT}"
+          echo "abi_id=${abi_id}" >> "${GITHUB_OUTPUT}"
+          echo "ABI cache identity: ${abi_id}"
+
+      - name: Restore exact Module.symvers
+        id: symvers-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: kernel-source/out/Module.symvers
+          key: infinityx-symvers-v2-${{ steps.abi.outputs.abi_id }}
+
+      - name: Download SHA-256-pinned exact Module.symvers
+        if: ${{ steps.symvers-cache.outputs.cache-hit != 'true' && inputs.module_symvers_url != '' }}
+        env:
+          SYMVERS_URL: ${{ inputs.module_symvers_url }}
+          SYMVERS_SHA256: ${{ inputs.module_symvers_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${SYMVERS_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::A 64-character module_symvers_sha256 is required with module_symvers_url."
+            exit 1
+          fi
+          curl --fail --location --retry 4 --retry-all-errors \
+            "${SYMVERS_URL}" -o downloaded.Module.symvers
+          echo "${SYMVERS_SHA256,,}  downloaded.Module.symvers" | sha256sum --check --strict
+          mv downloaded.Module.symvers kernel-source/out/Module.symvers
+
+      - name: Explain missing ABI seed
+        if: ${{ steps.symvers-cache.outputs.cache-hit != 'true' && inputs.module_symvers_url == '' && !inputs.allow_full_build }}
+        run: |
+          echo "::error::No exact Module.symvers exists for this ABI identity."
+          echo "::error::Run manually with a trusted URL and SHA-256, or set allow_full_build=true."
+          echo "::error::For Full LTO, select a runner with at least 32 GiB physical RAM."
+          echo "::error::A standard 16 GiB runner is known to swap heavily in vmlinux.o."
+          exit 1
+
+      - name: Bootstrap exact Module.symvers with one Full-LTO build
+        if: ${{ steps.symvers-cache.outputs.cache-hit != 'true' && inputs.module_symvers_url == '' && inputs.allow_full_build }}
+        working-directory: kernel-source
+        env:
+          CC: clang
+        run: |
+          set -euo pipefail
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
+          echo "Starting the one-time exact Full-LTO ABI bootstrap."
+          free -h
+          swapon --show || true
+          # modules_prepare cannot generate version CRCs. vmlinux is the
+          # smallest standard target that produces the complete Module.symvers.
+          make -j"${BUILD_JOBS}" O="${OUT_DIR}" \
+            ARCH="${ARCH}" LLVM=1 LLVM_IAS=1 CC="${CC}" vmlinux
+          test -s "${OUT_DIR}/vmlinux"
+          test -s "${OUT_DIR}/Module.symvers"
+
+      - name: Validate exact Module.symvers
+        id: symvers
+        working-directory: kernel-source
+        run: |
+          set -euo pipefail
+          test -s "${OUT_DIR}/Module.symvers"
+          if ! awk -F '\t' '
+            NF >= 4 && $1 ~ /^0x[0-9a-fA-F]{8}$/ && $2 != "" { valid++ }
+            END { exit(valid > 0 ? 0 : 1) }
+          ' "${OUT_DIR}/Module.symvers"; then
+            echo "::error::Module.symvers has no valid versioned symbol records."
+            exit 1
+          fi
+          symvers_sha256="$(sha256sum "${OUT_DIR}/Module.symvers" | awk '{print $1}')"
+          symbol_count="$(wc -l < "${OUT_DIR}/Module.symvers")"
+          echo "sha256=${symvers_sha256}" >> "${GITHUB_OUTPUT}"
+          echo "symbol_count=${symbol_count}" >> "${GITHUB_OUTPUT}"
+          echo "Module.symvers SHA-256: ${symvers_sha256}"
+          echo "Module.symvers records: ${symbol_count}"
+
+      - name: Enforce exact installed-kernel release
+        id: compatibility
+        working-directory: kernel-source
+        env:
+          CC: clang
+        run: |
+          set -euo pipefail
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "::error::Kernel source tree is dirty."
+            git status --short
+            exit 1
+          fi
+          actual_release="$(
+            make -s O="${OUT_DIR}" ARCH="${ARCH}" LLVM=1 LLVM_IAS=1 CC="${CC}" kernelrelease
+          )"
+          echo "actual_release=${actual_release}" >> "${GITHUB_OUTPUT}"
+          printf 'Expected: %s\nActual:   %s\n' "${EXPECTED_RELEASE}" "${actual_release}"
+          if [[ "${actual_release}" != "${EXPECTED_RELEASE}" ]]; then
+            echo "::error::Kernel source/ref/config does not reproduce the installed kernel release."
+            exit 1
+          fi
+
+      - name: Build miprotect.ko as an external module
+        working-directory: kernel-source
+        env:
+          CC: clang
+        run: |
+          set -euo pipefail
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
+          module_dir="${GITHUB_WORKSPACE}/memoryK/kernel"
+          module="${module_dir}/miprotect.ko"
+          make -j2 O="${OUT_DIR}" \
+            ARCH="${ARCH}" LLVM=1 LLVM_IAS=1 CC="${CC}" \
+            M="${module_dir}" CONFIG_MEMKERNEL=m modules
+          test -s "${module}"
+          module_release="$(modinfo -F vermagic "${module}" | awk '{print $1}')"
+          printf 'Expected vermagic: %s\nModule vermagic:   %s\n' \
+            "${EXPECTED_RELEASE}" "${module_release}"
+          if [[ "${module_release}" != "${EXPECTED_RELEASE}" ]]; then
+            echo "::error::miprotect.ko vermagic does not match the installed kernel."
+            exit 1
+          fi
+          if ! llvm-readelf -S "${module}" | grep -q '__versions'; then
+            echo "::error::miprotect.ko has no CONFIG_MODVERSIONS __versions section."
+            exit 1
+          fi
+          file "${module}"
+          modinfo "${module}"
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "::error::External module build modified tracked kernel files."
+            git status --short
+            exit 1
+          fi
+
+      - name: Prepare verified artifact
+        working-directory: kernel-source
+        run: |
+          set -euo pipefail
+          dist="${GITHUB_WORKSPACE}/${DIST_DIR}"
+          module="${GITHUB_WORKSPACE}/memoryK/kernel/miprotect.ko"
+          mkdir -p "${dist}"
+          cp "${module}" "${dist}/miprotect.ko"
+          cp "${OUT_DIR}/.config" "${dist}/kernel.config"
+          cp "${OUT_DIR}/Module.symvers" "${dist}/Module.symvers"
+          {
+            echo "kernel_repo=${KERNEL_REPO}"
+            echo "requested_ref=${KERNEL_REF}"
+            echo "resolved_commit=${{ steps.abi.outputs.resolved_commit }}"
+            echo "kernel_release=${{ steps.compatibility.outputs.actual_release }}"
+            echo "kernel_config_sha256=${{ steps.abi.outputs.config_sha256 }}"
+            echo "abi_cache_identity=${{ steps.abi.outputs.abi_id }}"
+            echo "module_symvers_sha256=${{ steps.symvers.outputs.sha256 }}"
+            echo "module_symvers_records=${{ steps.symvers.outputs.symbol_count }}"
+            echo "module_symvers_cache_hit=${{ steps.symvers-cache.outputs.cache-hit }}"
+            echo "clang_dir=${CLANG_DIR}"
+            echo "clang_ref=${CLANG_REF}"
+            echo
+            modinfo "${module}"
+          } > "${dist}/build-info.txt"
+          (
+            cd "${dist}"
+            sha256sum miprotect.ko Module.symvers kernel.config build-info.txt > SHA256SUMS
+          )
+          ls -lh "${dist}"
+
+      - name: Upload verified miprotect LKM and reusable ABI seed
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: miprotect-${{ steps.compatibility.outputs.actual_release }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9
