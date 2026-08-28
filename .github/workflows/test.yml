@@ -1,0 +1,1009 @@
+name: Infinity X Marble — Build & Verify miprotect LKM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "kernel/**"
+      - ".github/workflows/infinityx.yml"
+
+  pull_request:
+    branches: [main]
+    paths:
+      - "kernel/**"
+      - ".github/workflows/infinityx.yml"
+
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: Infinity X kernel repository
+        required: true
+        default: aosp-pablo/android_kernel_xiaomi_sm8450
+        type: string
+
+      kernel_ref:
+        description: Exact Infinity X branch, tag, or full commit
+        required: true
+        default: b4d13be4e909f7b74299b45ff0e8696226ca5fd8
+        type: string
+
+      expected_release:
+        description: Exact uname -r that miprotect.ko must match
+        required: true
+        default: 5.10.252-Infx-gb4d13be4e909
+        type: string
+
+      clang_ref:
+        description: Google Android Clang repository ref
+        required: true
+        default: d2de056d8d8de40b2c1ccd39bfadf0c0318f5bad
+        type: string
+
+      clang_dir:
+        description: Google Android Clang directory
+        required: true
+        default: clang-r563880c
+        type: string
+
+      module_symvers_url:
+        description: Optional exact Module.symvers URL; bypasses Full-LTO bootstrap
+        required: false
+        default: ""
+        type: string
+
+      runner_label:
+        description: Runner label; use a 32+ GB larger runner if available
+        required: false
+        default: ubuntu-24.04
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infinityx-marble-miprotect-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-lkm:
+    name: miprotect.ko · Infinity X Marble
+    runs-on: ${{ inputs.runner_label || 'ubuntu-24.04' }}
+
+    # GitHub-hosted jobs have a six-hour maximum.
+    # Leave enough room for a swap-heavy Full-LTO first build.
+    timeout-minutes: 350
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+
+      KERNEL_REPO: ${{ inputs.kernel_repo || 'aosp-pablo/android_kernel_xiaomi_sm8450' }}
+      KERNEL_REF: ${{ inputs.kernel_ref || 'b4d13be4e909f7b74299b45ff0e8696226ca5fd8' }}
+      EXPECTED_RELEASE: ${{ inputs.expected_release || '5.10.252-Infx-gb4d13be4e909' }}
+
+      CLANG_REF: ${{ inputs.clang_ref || 'd2de056d8d8de40b2c1ccd39bfadf0c0318f5bad' }}
+      CLANG_DIR: ${{ inputs.clang_dir || 'clang-r563880c' }}
+
+      MODULE_SYMVERS_URL: ${{ inputs.module_symvers_url || '' }}
+
+      KERNEL_DIR: kernel-source
+      OUT_DIR: out
+      DIST_DIR: dist
+
+      KBUILD_BUILD_USER: infinityx
+      KBUILD_BUILD_HOST: github-actions
+
+      CONFIG_FRAGMENTS: >-
+        vendor/waipio_GKI.config
+        vendor/xiaomi_GKI.config
+        vendor/marble_GKI.config
+        vendor/debugfs.config
+        vendor/infinity.config
+
+    steps:
+      # ---------------------------------------------------------
+      # RUNNER PREPARATION
+      # ---------------------------------------------------------
+
+      - name: Maximize build space and create 16 GiB swap
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 2048
+          temp-reserve-mb: 512
+          swap-size-mb: 16384
+
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - name: Tune runner for LLVM linker memory pressure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Start swapping somewhat earlier instead of waiting until
+          # physical memory is almost completely exhausted.
+          sudo sysctl -w vm.swappiness=100 || true
+
+          echo "================ RUNNER ================="
+          echo "CPUs: $(nproc)"
+          free -h
+          echo
+          swapon --show
+          echo
+          df -h /
+          echo "========================================="
+
+      # ---------------------------------------------------------
+      # SOURCES
+      # ---------------------------------------------------------
+
+      - name: Check out MemKernel
+        uses: actions/checkout@v4
+        with:
+          path: MemKernel
+          fetch-depth: 1
+
+      - name: Check out exact Infinity X kernel
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_REF }}
+          path: ${{ env.KERNEL_DIR }}
+
+          # Important for the expected:
+          # -gb4d13be4e909
+          fetch-depth: 1
+
+      - name: Verify exact kernel revision
+        id: kernel_revision
+        working-directory: kernel-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          resolved_commit="$(git rev-parse HEAD)"
+
+          echo "resolved_commit=${resolved_commit}" >> "${GITHUB_OUTPUT}"
+
+          echo "Requested: ${KERNEL_REF}"
+          echo "Resolved:  ${resolved_commit}"
+
+          if [[ "${KERNEL_REF}" =~ ^[0-9a-fA-F]{40}$ ]] &&
+             [[ "${resolved_commit,,}" != "${KERNEL_REF,,}" ]]; then
+
+            echo "::error::Kernel checkout does not match KERNEL_REF."
+            exit 1
+          fi
+
+          git diff --quiet
+          git diff --cached --quiet
+
+      # ---------------------------------------------------------
+      # BUILD DEPENDENCIES
+      # ---------------------------------------------------------
+
+      - name: Install kernel build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            curl \
+            dwarves \
+            flex \
+            git \
+            kmod \
+            libelf-dev \
+            libssl-dev \
+            lld \
+            llvm \
+            python3 \
+            rsync \
+            xz-utils \
+            zstd
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo
+          free -h
+          swapon --show
+          df -h /
+
+      # ---------------------------------------------------------
+      # EXACT CLANG TOOLCHAIN
+      # ---------------------------------------------------------
+
+      - name: Download matching Google Android Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p toolchain
+
+          archive_url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${CLANG_REF}/${CLANG_DIR}.tar.gz"
+
+          echo "Downloading:"
+          echo "${archive_url}"
+
+          curl \
+            --fail \
+            --location \
+            --retry 4 \
+            --retry-all-errors \
+            "${archive_url}" \
+            -o clang.tar.gz
+
+          tar -xzf clang.tar.gz -C toolchain
+          rm -f clang.tar.gz
+
+          test -x toolchain/bin/clang
+          test -x toolchain/bin/ld.lld
+
+          echo
+          toolchain/bin/clang --version
+          echo
+          toolchain/bin/ld.lld --version
+
+      # ---------------------------------------------------------
+      # EXTERNAL MODULE VALIDATION
+      # ---------------------------------------------------------
+
+      - name: Validate miprotect source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d MemKernel/kernel
+          test -f MemKernel/kernel/Makefile
+          test -f MemKernel/kernel/Kconfig
+
+          test -f MemKernel/kernel/memory.c
+          test -f MemKernel/kernel/process.c
+          test -f MemKernel/kernel/entry.c
+
+          echo "External module source:"
+          find MemKernel/kernel -maxdepth 1 -type f -printf '%f\n' | sort
+
+      # ---------------------------------------------------------
+      # EXACT KERNEL CONFIGURATION
+      # ---------------------------------------------------------
+
+      - name: Configure exact Infinity X Marble kernel
+        working-directory: kernel-source
+        shell: bash
+        env:
+          CC: clang
+        run: |
+          set -euo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
+
+          echo "Generating GKI base config..."
+
+          make \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC="${CC}" \
+            gki_defconfig
+
+          fragment_paths=()
+
+          for fragment in ${CONFIG_FRAGMENTS}; do
+            path="arch/arm64/configs/${fragment}"
+
+            if [[ ! -f "${path}" ]]; then
+              echo "::error::Missing config fragment: ${path}"
+              exit 1
+            fi
+
+            echo "Using config fragment: ${path}"
+            fragment_paths+=("${path}")
+          done
+
+          echo
+          echo "Merging Infinity X Marble configuration..."
+
+          scripts/kconfig/merge_config.sh \
+            -m \
+            -O "${OUT_DIR}" \
+            "${OUT_DIR}/.config" \
+            "${fragment_paths[@]}"
+
+          # Reproduce:
+          #
+          # 5.10.252-Infx-gb4d13be4e909
+
+          scripts/config \
+            --file "${OUT_DIR}/.config" \
+            --set-str LOCALVERSION "-Infx"
+
+          scripts/config \
+            --file "${OUT_DIR}/.config" \
+            --enable LOCALVERSION_AUTO
+
+          make \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC="${CC}" \
+            olddefconfig
+
+          # Force Kbuild to regenerate its config mirrors.
+          rm -f \
+            "${OUT_DIR}/include/config/auto.conf" \
+            "${OUT_DIR}/include/config/auto.conf.cmd" \
+            "${OUT_DIR}/include/generated/autoconf.h" \
+            "${OUT_DIR}/include/config/kernel.release"
+
+          # Prepare everything necessary for an external module.
+          make \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC="${CC}" \
+            modules_prepare
+
+          grep -qx \
+            'CONFIG_LOCALVERSION="-Infx"' \
+            "${OUT_DIR}/.config"
+
+          grep -qx \
+            'CONFIG_LOCALVERSION_AUTO=y' \
+            "${OUT_DIR}/.config"
+
+          grep -qx \
+            'CONFIG_MODULES=y' \
+            "${OUT_DIR}/.config"
+
+          prepared_release="$(
+            cat "${OUT_DIR}/include/config/kernel.release"
+          )"
+
+          echo
+          echo "Prepared release:"
+          echo "${prepared_release}"
+
+          if [[ "${prepared_release}" != "${EXPECTED_RELEASE}" ]]; then
+            echo "::error::Kernel release mismatch."
+            echo "::error::Expected: ${EXPECTED_RELEASE}"
+            echo "::error::Actual:   ${prepared_release}"
+            exit 1
+          fi
+
+          echo
+          echo "Important configuration:"
+          grep -E \
+            '^CONFIG_(LOCALVERSION|MODULES|MODVERSIONS|LTO|LTO_CLANG|LTO_CLANG_FULL|LTO_CLANG_THIN|CFI_CLANG|SHADOW_CALL_STACK|MODULE_SIG|MODULE_SIG_FORCE)=' \
+            "${OUT_DIR}/.config" || true
+
+      # ---------------------------------------------------------
+      # KERNEL RELEASE VERIFICATION
+      # ---------------------------------------------------------
+
+      - name: Verify exact installed kernel release
+        id: compatibility
+        working-directory: kernel-source
+        shell: bash
+        env:
+          CC: clang
+        run: |
+          set -euo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
+
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "::error::Kernel source tree became dirty."
+            git status --short
+            exit 1
+          fi
+
+          cached_release="$(
+            cat "${OUT_DIR}/include/config/kernel.release"
+          )"
+
+          actual_release="$(
+            make \
+              -s \
+              O="${OUT_DIR}" \
+              ARCH="${ARCH}" \
+              LLVM=1 \
+              LLVM_IAS=1 \
+              CC="${CC}" \
+              kernelrelease
+          )"
+
+          echo "actual_release=${actual_release}" >> "${GITHUB_OUTPUT}"
+
+          echo "Expected : ${EXPECTED_RELEASE}"
+          echo "Prepared : ${cached_release}"
+          echo "Actual   : ${actual_release}"
+
+          if [[ "${cached_release}" != "${EXPECTED_RELEASE}" ]]; then
+            echo "::error::Prepared kernel release mismatch."
+            exit 1
+          fi
+
+          if [[ "${actual_release}" != "${EXPECTED_RELEASE}" ]]; then
+            echo "::error::Final kernelrelease mismatch."
+            exit 1
+          fi
+
+      # ---------------------------------------------------------
+      # MODULE.SYMVERS CACHE
+      #
+      # This is the big optimization.
+      #
+      # Once a Full-LTO build succeeds once, later runs with the
+      # exact same kernel/config/toolchain reuse Module.symvers.
+      # ---------------------------------------------------------
+
+      - name: Compute Module.symvers cache identity
+        id: symvers_key
+        working-directory: kernel-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          config_sha="$(
+            sha256sum "${OUT_DIR}/.config" |
+            awk '{print $1}'
+          )"
+
+          resolved_commit="${{ steps.kernel_revision.outputs.resolved_commit }}"
+
+          cache_key="infinityx-symvers-v5-${resolved_commit}-${CLANG_REF}-${config_sha}"
+
+          echo "config_sha=${config_sha}" >> "${GITHUB_OUTPUT}"
+          echo "cache_key=${cache_key}" >> "${GITHUB_OUTPUT}"
+
+          echo "${cache_key}"
+
+      - name: Restore exact Module.symvers cache
+        id: symvers_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kernel-source/out/Module.symvers
+          key: ${{ steps.symvers_key.outputs.cache_key }}
+
+      # ---------------------------------------------------------
+      # OPTIONAL FASTEST PATH:
+      # externally supplied exact Module.symvers
+      # ---------------------------------------------------------
+
+      - name: Download supplied exact Module.symvers
+        if: env.MODULE_SYMVERS_URL != '' && steps.symvers_cache.outputs.cache-hit != 'true'
+        working-directory: kernel-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Using external Module.symvers:"
+          echo "${MODULE_SYMVERS_URL}"
+          echo
+          echo "WARNING:"
+          echo "This MUST originate from the exact Infinity X build."
+
+          curl \
+            --fail \
+            --location \
+            --retry 4 \
+            --retry-all-errors \
+            "${MODULE_SYMVERS_URL}" \
+            -o "${OUT_DIR}/Module.symvers"
+
+          test -s "${OUT_DIR}/Module.symvers"
+
+      # ---------------------------------------------------------
+      # FULL-LTO FALLBACK
+      #
+      # Only runs when:
+      #   1. no cache exists
+      #   2. no Module.symvers URL was supplied
+      #
+      # This is expected to be expensive only on the first build.
+      # ---------------------------------------------------------
+
+      - name: Bootstrap exact Module.symvers with Full LTO
+        if: steps.symvers_cache.outputs.cache-hit != 'true' && env.MODULE_SYMVERS_URL == ''
+        working-directory: kernel-source
+        shell: bash
+        env:
+          CC: clang
+        run: |
+          set -euo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
+
+          monitor_log="${GITHUB_WORKSPACE}/lto-monitor.log"
+
+          : > "${monitor_log}"
+
+          echo "No cached/external Module.symvers found."
+          echo "Starting one-time Full-LTO bootstrap."
+          echo
+
+          # -----------------------------------------------------
+          # Background resource monitor
+          # -----------------------------------------------------
+
+          (
+            while sleep 60; do
+              {
+                echo
+                echo "===== BUILD RESOURCE SNAPSHOT $(date -u '+%Y-%m-%d %H:%M:%S UTC') ====="
+
+                free -h || true
+
+                echo
+                swapon --show || true
+
+                echo
+                echo "Top processes by resident memory:"
+
+                ps \
+                  -eo pid,ppid,%cpu,%mem,rss,vsz,etime,comm,args \
+                  --sort=-rss |
+                  head -n 18 || true
+
+                echo
+                echo "Load:"
+                uptime || true
+
+                echo "=============================================================="
+              } | tee -a "${monitor_log}"
+
+            done
+          ) &
+
+          monitor_pid=$!
+
+          cleanup_monitor() {
+            kill "${monitor_pid}" 2>/dev/null || true
+            wait "${monitor_pid}" 2>/dev/null || true
+          }
+
+          trap cleanup_monitor EXIT
+
+          # Compilation itself can create additional memory pressure.
+          #
+          # LTO linking is mostly one giant ld.lld process anyway,
+          # so throwing four compile jobs at it does not fix that.
+          jobs="$(nproc)"
+
+          if (( jobs > 2 )); then
+            jobs=2
+          fi
+
+          echo "Compile jobs: ${jobs}"
+          echo
+
+          free -h
+          swapon --show
+
+          # IMPORTANT:
+          #
+          # Build vmlinux, NOT Image.
+          #
+          # We only need the complete kernel symbol/version information.
+          # There is no reason to create the final bootable Image.
+
+          make \
+            -j"${jobs}" \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC="${CC}" \
+            vmlinux
+
+          # Normally vmlinux modpost generates Module.symvers.
+          # Keep a fallback in case this vendor tree expects modules
+          # to complete the symbol-version output.
+
+          if [[ ! -s "${OUT_DIR}/Module.symvers" ]]; then
+
+            echo
+            echo "vmlinux finished without Module.symvers."
+            echo "Running modules target..."
+
+            make \
+              -j"${jobs}" \
+              O="${OUT_DIR}" \
+              ARCH="${ARCH}" \
+              LLVM=1 \
+              LLVM_IAS=1 \
+              CC="${CC}" \
+              modules
+          fi
+
+          test -s "${OUT_DIR}/vmlinux"
+          test -s "${OUT_DIR}/Module.symvers"
+
+          cleanup_monitor
+          trap - EXIT
+
+          echo
+          echo "Full-LTO bootstrap completed."
+
+          free -h
+          swapon --show
+
+      # ---------------------------------------------------------
+      # MODULE.SYMVERS VALIDATION
+      # ---------------------------------------------------------
+
+      - name: Validate Module.symvers
+        working-directory: kernel-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s "${OUT_DIR}/Module.symvers"
+
+          line_count="$(
+            wc -l < "${OUT_DIR}/Module.symvers"
+          )"
+
+          size="$(
+            stat -c '%s' "${OUT_DIR}/Module.symvers"
+          )"
+
+          echo "Module.symvers lines: ${line_count}"
+          echo "Module.symvers bytes: ${size}"
+
+          # Reject obviously broken/truncated files.
+          if (( line_count < 100 )); then
+            echo "::error::Module.symvers is suspiciously small."
+            exit 1
+          fi
+
+          if ! grep -Eq \
+            '^0x[0-9a-fA-F]{8}[[:space:]]+' \
+            "${OUT_DIR}/Module.symvers"; then
+
+            echo "::error::Module.symvers contains no normal CRC entries."
+            exit 1
+          fi
+
+      # Cache only a Module.symvers that WE generated from the exact
+      # kernel build.
+      #
+      # Do not poison the cache with a user-supplied URL.
+
+      - name: Cache generated Module.symvers
+        if: steps.symvers_cache.outputs.cache-hit != 'true' && env.MODULE_SYMVERS_URL == ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: kernel-source/out/Module.symvers
+          key: ${{ steps.symvers_key.outputs.cache_key }}
+
+      # ---------------------------------------------------------
+      # BUILD THE ACTUAL LKM
+      # ---------------------------------------------------------
+
+      - name: Build miprotect.ko
+        working-directory: kernel-source
+        shell: bash
+        env:
+          CC: clang
+        run: |
+          set -euo pipefail
+
+          export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
+
+          module_dir="${GITHUB_WORKSPACE}/MemKernel/kernel"
+          module="${module_dir}/miprotect.ko"
+
+          echo "========================================="
+          echo "Building external module"
+          echo "========================================="
+          echo "Kernel : ${EXPECTED_RELEASE}"
+          echo "Module : ${module}"
+          echo
+
+          # Remove any generated files left from an earlier attempt.
+          make \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC="${CC}" \
+            M="${module_dir}" \
+            CONFIG_MEMKERNEL=m \
+            clean || true
+
+          make \
+            -j"$(nproc)" \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC="${CC}" \
+            M="${module_dir}" \
+            CONFIG_MEMKERNEL=m \
+            modules
+
+          test -s "${module}"
+
+          echo
+          echo "========================================="
+          echo "Built module"
+          echo "========================================="
+
+          file "${module}"
+          echo
+
+          modinfo "${module}"
+
+          module_release="$(
+            modinfo -F vermagic "${module}" |
+            awk '{print $1}'
+          )"
+
+          echo
+          echo "Expected vermagic : ${EXPECTED_RELEASE}"
+          echo "Module vermagic   : ${module_release}"
+
+          if [[ "${module_release}" != "${EXPECTED_RELEASE}" ]]; then
+            echo "::error::miprotect.ko vermagic mismatch."
+            exit 1
+          fi
+
+          # -----------------------------------------------------
+          # MODVERSIONS validation
+          # -----------------------------------------------------
+
+          if grep -qx \
+            'CONFIG_MODVERSIONS=y' \
+            "${OUT_DIR}/.config"; then
+
+            echo
+            echo "CONFIG_MODVERSIONS=y"
+            echo "Checking embedded symbol CRC versions..."
+
+            if ! readelf -SW "${module}" |
+                 grep -q '__versions'; then
+
+              echo "::error::Module has no __versions section."
+              exit 1
+            fi
+
+            modprobe \
+              --dump-modversions \
+              "${module}" \
+              > "${GITHUB_WORKSPACE}/module-versions.txt"
+
+            if [[ ! -s "${GITHUB_WORKSPACE}/module-versions.txt" ]]; then
+              echo "::error::No symbol-version CRCs embedded in miprotect.ko."
+              exit 1
+            fi
+
+            echo
+            echo "Embedded symbol versions:"
+            head -n 25 "${GITHUB_WORKSPACE}/module-versions.txt"
+          fi
+
+          # The external build must not patch the Infinity X tree.
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "::error::External module build modified kernel source."
+            git status --short
+            exit 1
+          fi
+
+          echo
+          echo "miprotect.ko passed build verification."
+
+      # ---------------------------------------------------------
+      # PACKAGE
+      # ---------------------------------------------------------
+
+      - name: Prepare verified artifact
+        working-directory: kernel-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dist="${GITHUB_WORKSPACE}/${DIST_DIR}"
+
+          module="${GITHUB_WORKSPACE}/MemKernel/kernel/miprotect.ko"
+
+          mkdir -p "${dist}"
+
+          test -s "${module}"
+          test -s "${OUT_DIR}/.config"
+          test -s "${OUT_DIR}/Module.symvers"
+
+          cp \
+            "${module}" \
+            "${dist}/miprotect.ko"
+
+          cp \
+            "${OUT_DIR}/.config" \
+            "${dist}/kernel.config"
+
+          cp \
+            "${OUT_DIR}/Module.symvers" \
+            "${dist}/Module.symvers"
+
+          if [[ -s "${GITHUB_WORKSPACE}/module-versions.txt" ]]; then
+            cp \
+              "${GITHUB_WORKSPACE}/module-versions.txt" \
+              "${dist}/module-versions.txt"
+          fi
+
+          if [[ -s "${GITHUB_WORKSPACE}/lto-monitor.log" ]]; then
+            cp \
+              "${GITHUB_WORKSPACE}/lto-monitor.log" \
+              "${dist}/lto-monitor.log"
+          fi
+
+          {
+            echo "kernel_repo=${KERNEL_REPO}"
+            echo "requested_ref=${KERNEL_REF}"
+            echo "resolved_commit=$(git rev-parse HEAD)"
+
+            echo "kernel_release=${{ steps.compatibility.outputs.actual_release }}"
+
+            echo "clang_dir=${CLANG_DIR}"
+            echo "clang_ref=${CLANG_REF}"
+
+            echo "config_sha256=${{ steps.symvers_key.outputs.config_sha }}"
+
+            if [[ "${{ steps.symvers_cache.outputs.cache-hit }}" == "true" ]]; then
+
+              echo "module_symvers_source=github-actions-cache"
+
+            elif [[ -n "${MODULE_SYMVERS_URL}" ]]; then
+
+              echo "module_symvers_source=external-url"
+
+            else
+
+              echo "module_symvers_source=full-lto-build"
+
+            fi
+
+            echo
+            echo "===== MODINFO ====="
+
+            modinfo "${module}"
+
+          } > "${dist}/build-info.txt"
+
+          (
+            cd "${dist}"
+
+            sha256sum \
+              miprotect.ko \
+              Module.symvers \
+              kernel.config \
+              > SHA256SUMS
+          )
+
+          echo
+          echo "========================================="
+          echo "Artifact contents"
+          echo "========================================="
+
+          ls -lh "${dist}"
+
+      # ---------------------------------------------------------
+      # UPLOAD SUCCESSFUL BUILD
+      # ---------------------------------------------------------
+
+      - name: Upload verified miprotect LKM
+        uses: actions/upload-artifact@v4
+        with:
+          name: miprotect-${{ steps.compatibility.outputs.actual_release }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------------------------------------------------------
+      # FAILURE DIAGNOSTICS
+      # ---------------------------------------------------------
+
+      - name: Collect failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
+          diagnostics="${GITHUB_WORKSPACE}/failure-diagnostics"
+
+          mkdir -p "${diagnostics}"
+
+          {
+            echo "========================================="
+            echo "DATE"
+            echo "========================================="
+
+            date -u
+
+            echo
+            echo "========================================="
+            echo "MEMORY"
+            echo "========================================="
+
+            free -h
+
+            echo
+            echo "========================================="
+            echo "SWAP"
+            echo "========================================="
+
+            swapon --show
+
+            echo
+            echo "========================================="
+            echo "DISK"
+            echo "========================================="
+
+            df -h
+
+            echo
+            echo "========================================="
+            echo "TOP RSS PROCESSES"
+            echo "========================================="
+
+            ps \
+              -eo pid,ppid,%cpu,%mem,rss,vsz,etime,comm,args \
+              --sort=-rss |
+              head -n 30
+
+            echo
+            echo "========================================="
+            echo "OOM MESSAGES"
+            echo "========================================="
+
+            sudo dmesg 2>/dev/null |
+              grep -Ei \
+              'oom|out of memory|killed process' |
+              tail -n 100
+
+          } > "${diagnostics}/runner-state.txt" 2>&1
+
+          if [[ -f "${GITHUB_WORKSPACE}/lto-monitor.log" ]]; then
+
+            cp \
+              "${GITHUB_WORKSPACE}/lto-monitor.log" \
+              "${diagnostics}/"
+          fi
+
+          if [[ -f "${GITHUB_WORKSPACE}/kernel-source/out/.config" ]]; then
+
+            cp \
+              "${GITHUB_WORKSPACE}/kernel-source/out/.config" \
+              "${diagnostics}/kernel.config"
+          fi
+
+          if [[ -f "${GITHUB_WORKSPACE}/kernel-source/out/Module.symvers" ]]; then
+
+            cp \
+              "${GITHUB_WORKSPACE}/kernel-source/out/Module.symvers" \
+              "${diagnostics}/Module.symvers"
+          fi
+
+      - name: Upload failure diagnostics
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: infinityx-lkm-failure-diagnostics
+          path: failure-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
