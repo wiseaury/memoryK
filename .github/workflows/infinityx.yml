@@ -328,7 +328,10 @@ jobs:
           set -euo pipefail
           export PATH="${GITHUB_WORKSPACE}/toolchain/bin:${PATH}"
 
-          make -j2 O="${OUT_DIR}" \
+          echo "CPUs available: $(nproc)"
+          echo "Building kernel with $(nproc) parallel jobs"
+
+          make -j"$(nproc)" O="${OUT_DIR}" \
             ARCH="${ARCH}" \
             LLVM=1 \
             LLVM_IAS=1 \
@@ -356,9 +359,11 @@ jobs:
           module_dir="${GITHUB_WORKSPACE}/MemKernel/kernel"
           module="${module_dir}/miprotect.ko"
 
+          echo "Building external module with $(nproc) parallel jobs"
+
           # CONFIG_MEMKERNEL is supplied on the make command line because the
           # module's Kconfig is intentionally NOT injected into the kernel tree.
-          make -j2 O="${OUT_DIR}" \
+          make -j"$(nproc)" O="${OUT_DIR}" \
             ARCH="${ARCH}" \
             LLVM=1 \
             LLVM_IAS=1 \
